@@ -1,155 +1,321 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+"""
+app.py – Streamlit Dashboard for the Juice Plant SimPy Simulation
+=================================================================
+Run with:
+    uv run streamlit run CaseStudy/app.py
+
+Tabs:
+  1. Single Run       – run one simulation, explore logs and all charts
+  2. Seed Variation   – N seeds, stochastic sensitivity plots
+  3. Parameter Sweep  – vary one parameter (+ optional seeds), see KPI trends
+  4. Combined         – sweep × seed variation with error bands
+"""
+
 import sys
 import os
 
-# Ensure src is in path
-sys.path.append(os.getcwd())
+# Make sure the CaseStudy folder is importable regardless of cwd
+sys.path.insert(0, os.path.dirname(__file__))
 
-from src.model import SimulationConfig
-from src.experiment import run_single_simulation, run_stochastic_variation, run_parameter_sweep
-from src.visualization import (plot_queue_over_time, plot_queue_distribution, 
-                              plot_server_utilization, plot_sojourn_times, plot_simulation_metrics)
+import numpy as np
+import pandas as pd
+import streamlit as st
+from dataclasses import replace
 
-st.set_page_config(page_title="Bank Simulation", layout="wide")
-
-st.title("🏦 Bank Discrete Event Simulation")
-
-# Sidebar - Global Configuration
-st.sidebar.header("Simulation Parameters")
-
-arrival_rate = st.sidebar.slider("Arrival Rate (entities/s)", 0.1, 2.0, 0.6, 0.1)
-duration_hours = st.sidebar.number_input("Duration (hours)", 1, 48, 24)
-duration_sec = duration_hours * 3600
-
-st.sidebar.subheader("Counter Settings")
-counter_cap = st.sidebar.number_input("Counter Capacity", 1, 10, 4)
-counter_mean = st.sidebar.number_input("Counter Mean Service (s)", 5.0, 60.0, 13.0)
-counter_std = st.sidebar.number_input("Counter Std Dev (s)", 0.0, 20.0, 5.0)
-
-st.sidebar.subheader("ATM Settings")
-atm_cap = st.sidebar.number_input("ATM Capacity", 1, 5, 1)
-atm_mean = st.sidebar.number_input("ATM Mean Service (s)", 1.0, 20.0, 2.0)
-atm_std = st.sidebar.number_input("ATM Std Dev (s)", 0.0, 5.0, 1.0)
-
-# Base Config
-base_config = SimulationConfig(
-    arrival_rate=arrival_rate,
-    simulation_duration=duration_sec,
-    counter_capacity=counter_cap,
-    counter_mean_service_time=counter_mean,
-    counter_std_service_time=counter_std,
-    atm_capacity=atm_cap,
-    atm_mean_service_time=atm_mean,
-    atm_std_service_time=atm_std
+from model import Params
+from experiment import (
+    run_single,
+    run_seed_variation,
+    run_parameter_sweep,
+)
+from visualization import (
+    plot_container_levels,
+    plot_process_gantt,
+    plot_sweep_results,
+    plot_seed_variation,
+    plot_seed_container_variation,
 )
 
-# Tabs for different modes
-tab1, tab2, tab3, tab4 = st.tabs(["Single Run", "Stochastic Variation", "Parameter Sweep", "Combined Experiment"])
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="🍎 Juice Plant Simulation",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
+st.title("🍎 Juice Plant – Discrete Event Simulation")
+st.caption("SimPy-based production simulation: apples → washing → shredding → pressing → concentration → storage")
+
+# ---------------------------------------------------------------------------
+# Sidebar – shared parameters
+# ---------------------------------------------------------------------------
+st.sidebar.header("🔧 Simulation Parameters")
+
+with st.sidebar.expander("Simulation", expanded=True):
+    sim_hours          = st.number_input("Sim Duration [hours]",     1, 20000, 72, 24)
+    monitor_interval   = st.number_input("Monitor Interval [min]",   0.005, 1000.0, 1.0, 0.5)
+
+with st.sidebar.expander("Arrival"):
+    interarrival_min     = st.number_input("Mean Inter-Arrival [min]", 1, 50000, 300, 100)
+    deterministic_arrival = st.checkbox("Deterministic Arrivals", value=True,
+                                         help="Checked → fixed Inter-Arrival-Time; unchecked → random exponential")
+    batch_size_min       = st.number_input("Batch Size Min [apples]",  50,  1000000,  25000, 50)
+    batch_size_max       = st.number_input("Batch Size Max [apples]",  50,  1000000,  25000, 50)
+
+with st.sidebar.expander("Wash & Shred"):
+    wash_shred_lines = st.number_input("Wash & Shred Lines",           1, 10, 1)
+    wash_shred_rate  = st.number_input("Wash & Shred Rate [apples/min]", 50.0, 2000.0, 120.0, 50.0)
+    # entity_batch_size = st.number_input("Wash/Shred Batch Size [apples]", 10, 100000, 100, 100)
+
+with st.sidebar.expander("Pressing"):
+    presses            = st.number_input("Press Units",              1, 10, 1)
+    press_batch_size   = st.number_input("Press Batch Size [apples]",100, 50000, 7000, 100)
+    press_time         = st.number_input("Press Time [min]",         1.0, 500.0, 90.0, 1.0)
+    liters_per_apple_mean = st.number_input("Yield Mean [L/apple]",  0.0, 1.0, 0.12, 0.01)
+    liters_per_apple_sd   = st.number_input("Yield Std Dev [L/apple]",0.0, 1.0, 0.01, 0.01)
+
+with st.sidebar.expander("Concentration"):
+    concentrators      = st.number_input("Concentrator Units",       1, 10, 1)
+    conc_rate          = st.number_input("Conc. Rate [L/min]",       1.0, 500.0, 8.0, 1.0)
+    conc_factor        = st.slider("Concentration Factor",           0.05, 1.0, 0.30, 0.05)
+    # conc_chunk         = st.number_input("Chunk Size [L]",           1.0, 100000.0, 10.0, 50.0)
+
+base_params = Params(
+    interarrival_min=interarrival_min,
+    deterministic_arrival=bool(deterministic_arrival),
+    batch_size_min=int(batch_size_min),
+    batch_size_max=int(batch_size_max),
+    wash_shred_lines=int(wash_shred_lines),
+    wash_shred_rate_apples_per_min=wash_shred_rate,
+    entity_batch_size_apples=10, # entity_batch_size
+    presses=int(presses),
+    press_batch_size_apples=int(press_batch_size),
+    press_time_min=press_time,
+    liters_per_apple_mean=liters_per_apple_mean,
+    liters_per_apple_sd=liters_per_apple_sd,
+    concentrators=int(concentrators),
+    conc_rate_liters_per_min=conc_rate,
+    conc_factor=conc_factor,
+    conc_chunk_liters=10, # conc_chunk
+    sim_time_min=sim_hours * 60,
+    monitor_interval_min=monitor_interval,
+)
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Single Run",
+    "🎲 Seed Variation",
+    "🔬 Parameter Sweep",
+    "🧪 Combined Experiment",
+])
+
+
+# ============================================================
+# TAB 1 – Single Run
+# ============================================================
 with tab1:
     st.header("Single Simulation Run")
-    seed = st.number_input("Random Seed (Optional)", value=42, step=1, key="single_seed")
-    
-    if st.button("Run Simulation", key="btn_single"):
-        config = base_config
-        config.seed = seed
-        
-        with st.spinner("Running simulation..."):
-            results = run_single_simulation(config)
-            
-        st.success("Simulation Complete!")
-        
-        # Metrics
-        entity_logs = results['entity_logs']
-        queue_logs = results['queue_logs']
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Entities", len(entity_logs))
-        c2.metric("Avg Wait (Counter)", f"{entity_logs[entity_logs['entity_type']=='counter']['wait_time'].mean():.2f} s")
-        c3.metric("Avg Wait (ATM)", f"{entity_logs[entity_logs['entity_type']=='atm']['wait_time'].mean():.2f} s")
-        c4.metric("Max Queue (Counter)", queue_logs['counter_queue'].max())
-        
-        # Plots
-        st.subheader("Queue Analysis")
-        st.plotly_chart(plot_queue_over_time(queue_logs), use_container_width=True)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(plot_queue_distribution(queue_logs), use_container_width=True)
-        with col2:
-            st.plotly_chart(plot_server_utilization(queue_logs), use_container_width=True)
-            
-        st.subheader("Time Distribution")
-        st.markdown("Distribution of Wait, Service, and Sojourn times.")
-        st.plotly_chart(plot_sojourn_times(entity_logs), use_container_width=True)
-        
-        st.expander("Raw Data").dataframe(entity_logs)
+    col_seed, col_btn = st.columns([1, 3])
+    with col_seed:
+        seed = st.number_input("Random Seed", value=42, step=1, key="t1_seed")
+    with col_btn:
+        st.write("")  # spacer
+        run_btn = st.button("▶ Run Simulation", key="btn_single", type="primary")
 
+    if run_btn:
+        p = replace(base_params, random_seed=int(seed))
+        with st.spinner("Running simulation…"):
+            result = run_single(p)
+
+        proc_df = result["process_logs"]
+        cont_df = result["container_logs"]
+
+        # --- KPI tiles ------------------------------------------------------
+        arrivals  = proc_df[(proc_df["step"] == "arrival") & (proc_df["event"] == "arrived")]
+        presses_f = proc_df[(proc_df["step"] == "press")   & (proc_df["event"] == "finished")]
+        conc_f    = proc_df[(proc_df["step"] == "concentrate") & (proc_df["event"] == "finished")]
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Batches Arrived",         len(arrivals))
+        k2.metric("Apples Arrived",          f"{arrivals['quantity'].sum():,.0f}")
+        k3.metric("Press Batches Completed", len(presses_f))
+        k4.metric("Conc. Cycles Completed",  len(conc_f))
+        k5.metric("Final Storage [L]",
+                  f"{cont_df['storage_tank'].iloc[-1]:.1f}" if not cont_df.empty else "–")
+
+        st.divider()
+
+        # --- Charts ---------------------------------------------------------
+        st.subheader("Container & Buffer Levels")
+        st.plotly_chart(plot_container_levels(cont_df), width='stretch')
+
+        st.subheader("Process Step Activity")
+        st.plotly_chart(plot_process_gantt(proc_df), width='stretch')
+
+        # --- Raw data -------------------------------------------------------
+        with st.expander("📋 Process Logs (raw)"):
+            st.dataframe(proc_df, width='stretch')
+        with st.expander("📋 Container Logs (raw)"):
+            st.dataframe(cont_df, width='stretch')
+
+
+# ============================================================
+# TAB 2 – Seed Variation
+# ============================================================
 with tab2:
-    st.header("Stochastic Variation (Seed Sensitivity)")
-    num_seeds = st.slider("Number of Random Seeds", 5, 50, 10)
-    
-    if st.button("Run Variation", key="btn_stoch"):
-        seeds = list(range(num_seeds)) # Simple range of seeds
-        
-        with st.spinner(f"Running {num_seeds} simulations..."):
-            df_results = run_stochastic_variation(base_config, seeds)
-            
-        st.subheader("Results Distribution")
-        st.plotly_chart(plot_simulation_metrics(df_results), use_container_width=True)
-        
-        st.dataframe(df_results.describe())
+    st.header("Stochastic Seed Variation")
+    st.markdown("Run the same parameter set with multiple random seeds to evaluate variance.")
 
+    n_seeds = st.slider("Number of Seeds", 3, 50, 10, key="t2_seeds")
+    seeds_list = list(range(n_seeds))
+
+    if st.button("▶ Run Seed Variation", key="btn_seed", type="primary"):
+        with st.spinner(f"Running {n_seeds} simulations…"):
+            results = run_seed_variation(base_params, seeds_list)
+
+        summary_df  = results["summary"]
+        all_proc    = results["all_process_logs"]
+        all_cont    = results["all_container_logs"]
+
+        st.success(f"Completed {n_seeds} runs.")
+
+        # KPI distributions
+        st.subheader("KPI Distributions across Seeds")
+        kpis = [
+            "press_batches_finished",
+            "concentrate_quantity_out",
+            "final_storage_liters",
+            "avg_apple_buffer",
+        ]
+        cols = st.columns(2)
+        for i, kpi in enumerate(kpis):
+            if kpi in summary_df.columns:
+                with cols[i % 2]:
+                    st.plotly_chart(plot_seed_variation(summary_df, kpi),
+                                    width='stretch')
+
+        st.subheader("Storage Tank Level across Seeds")
+        st.plotly_chart(
+            plot_seed_container_variation(all_cont, "storage_tank"),
+            width='stretch',
+        )
+
+        st.subheader("Apple Buffer Level across Seeds")
+        st.plotly_chart(
+            plot_seed_container_variation(all_cont, "apple_buffer"),
+            width='stretch',
+        )
+
+        with st.expander("📋 Summary Table"):
+            st.dataframe(summary_df.describe(), width='stretch')
+
+
+# ============================================================
+# TAB 3 – Parameter Sweep
+# ============================================================
 with tab3:
     st.header("Parameter Sweep")
-    param = st.selectbox("Parameter to Vary", [
-        "arrival_rate", "counter_capacity", "counter_mean_service_time"
-    ])
-    
-    start_val = st.number_input("Start Value", value=0.1)
-    end_val = st.number_input("End Value", value=1.0)
-    step_val = st.number_input("Step", value=0.1)
-    
-    if st.button("Run Sweep", key="btn_sweep"):
-        # Generate values. Handle float vs int
-        if "capacity" in param or "seed" in param:
-             values = np.arange(int(start_val), int(end_val)+1, int(step_val))
-        else:
-             values = np.arange(start_val, end_val + step_val/10, step_val)
-             
-        with st.spinner(f"Running sweep over {param}..."):
-            df_results = run_parameter_sweep(base_config, param, values) # seed=None by default
-            
-        st.subheader(f"Impact of {param}")
-        st.plotly_chart(plot_simulation_metrics(df_results, x_col=param), use_container_width=True)
-        st.dataframe(df_results)
+    st.markdown("Vary one simulation parameter and observe its impact on KPIs.")
 
-with tab4:
-    st.header("Combined Experiment (Sweep + Stochastic)")
-    st.markdown("Varies a parameter while running multiple seeds per value to capture variance.")
-    
-    c_param = st.selectbox("Parameter to Vary", ["arrival_rate", "counter_capacity"], key="comb_param")
-    
-    c_start = st.number_input("Start", value=0.1, key="c_start")
-    c_end = st.number_input("End", value=1.0, key="c_end")
-    c_step = st.number_input("Step", value=0.1, key="c_step")
-    c_seeds = st.slider("Seeds per value", 3, 20, 5, key="c_seeds")
-    
-    if st.button("Run Combined Experiment", key="btn_comb"):
-        # Range generation
-        if "capacity" in c_param:
-             range_vals = np.arange(int(c_start), int(c_end)+1, int(c_step))
+    param_options = {
+        # "Washers":               "washers",
+        # "Shredder Lines":        "shredders",
+        "Wash & Shred Lines":    "wash_shred_lines",
+        "Press Units":           "presses",
+        "Concentrators":         "concentrators",
+        "Inter-arrival [min]":   "interarrival_min",
+        "Press Batch Size":      "press_batch_size_apples",
+        "Press Time [min]":      "press_time_min",
+        "Conc. Factor":          "conc_factor",
+        "Wash Rate [apples/min]":"wash_rate_apples_per_min",
+    }
+
+    col_p, col_s, col_e, col_st = st.columns(4)
+    with col_p:
+        param_label = st.selectbox("Parameter to Vary", list(param_options.keys()), key="t3_param")
+    param_name = param_options[param_label]
+    current_val = getattr(base_params, param_name)
+
+    with col_s:
+        start_val = st.number_input("Start Value", value=float(max(1, current_val * 0.5)), key="t3_start")
+    with col_e:
+        end_val   = st.number_input("End Value",   value=float(current_val * 2.0), key="t3_end")
+    with col_st:
+        step_val  = st.number_input("Step",        value=float(max(1, (current_val * 2 - current_val * 0.5) / 5)), key="t3_step")
+
+    sweep_seed = st.number_input("Seed", value=42, step=1, key="t3_seed")
+
+    if st.button("▶ Run Sweep", key="btn_sweep", type="primary"):
+        is_int = isinstance(current_val, int)
+        if is_int:
+            values = list(range(int(start_val), int(end_val) + 1, max(1, int(step_val))))
         else:
-             range_vals = np.arange(c_start, c_end + c_step/10, c_step)
-             
-        seeds_list = list(range(c_seeds))
-        
-        with st.spinner("Running combined experiment..."):
-            df_res = run_parameter_sweep(base_config, c_param, range_vals, seeds=seeds_list)
-            
-        st.subheader("Results with Confidence Intervals")
-        st.plotly_chart(plot_simulation_metrics(df_res, x_col=c_param), use_container_width=True)
-        
-        st.dataframe(df_res)
+            values = list(np.arange(start_val, end_val + step_val / 10, step_val))
+
+        p = replace(base_params, random_seed=int(sweep_seed))
+        with st.spinner(f"Running sweep over {param_label} ({len(values)} values)…"):
+            sweep_df = run_parameter_sweep(p, param_name, values, seeds=[int(sweep_seed)])
+
+        st.success(f"Sweep complete: {len(sweep_df)} runs.")
+        st.plotly_chart(plot_sweep_results(sweep_df, param_name),
+                        width='stretch')
+
+        with st.expander("📋 Sweep Results Table"):
+            st.dataframe(sweep_df, width='stretch')
+
+
+# ============================================================
+# TAB 4 – Combined Experiment (Sweep × Seeds)
+# ============================================================
+with tab4:
+    st.header("Combined Experiment (Sweep × Seed Variation)")
+    st.markdown("Vary a parameter while also running multiple seeds per value – reveals both trend and uncertainty.")
+
+    param_options_c = {
+        # "Washers":               "washers",
+        "Wash & Shred Lines":    "wash_shred_lines",
+        "Press Units":           "presses",
+        "Concentrators":         "concentrators",
+        "Inter-arrival [min]":   "interarrival_min",
+        "Press Batch Size":      "press_batch_size_apples",
+        "Conc. Factor":          "conc_factor",
+    }
+
+    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+    with cc1:
+        c_label  = st.selectbox("Parameter", list(param_options_c.keys()), key="t4_param")
+    c_name = param_options_c[c_label]
+    c_cur  = getattr(base_params, c_name)
+
+    with cc2:
+        c_start = st.number_input("Start", value=float(max(1, c_cur * 0.5)), key="t4_start")
+    with cc3:
+        c_end   = st.number_input("End",   value=float(c_cur * 2.0), key="t4_end")
+    with cc4:
+        c_step  = st.number_input("Step",  value=float(max(1, (c_cur * 2 - c_cur * 0.5) / 5)), key="t4_step")
+    with cc5:
+        c_seeds = st.slider("Seeds per value", 3, 20, 5, key="t4_nseeds")
+
+    if st.button("▶ Run Combined Experiment", key="btn_comb", type="primary"):
+        is_int_c = isinstance(c_cur, int)
+        if is_int_c:
+            c_values = list(range(int(c_start), int(c_end) + 1, max(1, int(c_step))))
+        else:
+            c_values = list(np.arange(c_start, c_end + c_step / 10, c_step))
+
+        c_seeds_list = list(range(c_seeds))
+        total_runs = len(c_values) * c_seeds
+
+        with st.spinner(f"Running {total_runs} simulations ({len(c_values)} values × {c_seeds} seeds)…"):
+            comb_df = run_parameter_sweep(base_params, c_name, c_values, seeds=c_seeds_list)
+
+        st.success(f"Done: {len(comb_df)} runs.")
+        st.plotly_chart(plot_sweep_results(comb_df, c_name),
+                        width='stretch')
+
+        with st.expander("📋 Full Results Table"):
+            st.dataframe(comb_df, width='stretch')

@@ -1,3 +1,10 @@
+# Notizen intern 
+
+    * Auslastung (Utilization) ist statisch einfach berechenbar mittels ρ = λ/μ = (Ankunftsrate)/(Servicerate)  Prozess nur stabil, solange ρ<1
+    * Für M/M/1-Queue gibt es noch genauere Formeln… 
+    * Für weitere Analysen --> Simulation 
+
+
 # Bank Simulation Project
 
 This project implements a Discrete Event Simulation (DES) of a bank branch using **SimPy** and provides an interactive web interface using **Streamlit**.
